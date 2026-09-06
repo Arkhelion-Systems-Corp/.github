@@ -1,0 +1,48 @@
+name: arkhelion-ruleset-canary
+
+# Disposable source workflow for proving GitHub Team ruleset-required-workflow
+# semantics without touching Arkhelion-OS main. It has no secrets, no checkout,
+# no write permissions, and no external effects. Delete after #946 canary proof.
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    name: arkhelion ruleset root / canary
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Record immutable event identity
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          MERGE_GROUP_HEAD: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          printf 'event=%s pr=%s head=%s base=%s draft=%s merge_group_head=%s\n' \
+            "$EVENT_NAME" "${PR_NUMBER:-}" "${PR_HEAD:-}" "${PR_BASE:-}" \
+            "${PR_DRAFT:-}" "${MERGE_GROUP_HEAD:-}"
+
+      - name: Controlled negative verdict
+        if: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          case "$PR_TITLE" in
+            *'[RULESET-CANARY-FAIL]'*)
+              echo '::error::intentional ruleset canary failure'
+              exit 1
+              ;;
+          esac
+          echo 'ruleset canary PASS'
