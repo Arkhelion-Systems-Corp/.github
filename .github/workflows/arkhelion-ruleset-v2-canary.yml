@@ -1,0 +1,61 @@
+name: arkhelion-ruleset-v2-canary
+
+# Disposable #946 proof source only. This workflow carries no secrets, performs
+# no checkout, and has no repository/provider mutation authority. It exists to
+# prove the Team-plan composition of exact-SHA required-workflow identity with
+# GitHub's separate strict/up-to-date status-check rule.
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  admission:
+    name: admission / pinned workflow
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Bind pull-request identity and deliberate negative marker
+        if: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          printf 'base_sha=%s\nhead_sha=%s\n' "$BASE_SHA" "$HEAD_SHA"
+          case "$PR_TITLE" in
+            *'[RULESET-V2-FAIL]'*)
+              echo '::error::deliberate v2 required-workflow negative control'
+              exit 1
+              ;;
+          esac
+
+      - name: Bind merge-group identity
+        if: ${{ github.event_name == 'merge_group' }}
+        shell: bash
+        env:
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          printf 'merge_group_head_sha=%s\n' "$HEAD_SHA"
+
+  freshness:
+    # This check name is intentionally non-authoritative. The v2 ruleset can
+    # require it only to activate GitHub's server-side strict/up-to-date rule.
+    # Security/admission remains owned by the exact-SHA-pinned workflow itself.
+    name: freshness / anchor
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Emit exact event identity
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          printf 'event=%s\nhead_sha=%s\n' "$EVENT_NAME" "$HEAD_SHA"
