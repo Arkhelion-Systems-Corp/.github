@@ -1,0 +1,245 @@
+name: Arkhelion ruleset v2 external production canary
+
+# Disposable #946 source. GitHub's organization ruleset pins this workflow to an
+# exact commit. The launcher lives outside Arkhelion-OS so a candidate cannot
+# rewrite its executable wrapper. Policy remains single-sourced: this workflow
+# checks out only the target PR's exact trusted BASE SHA and runs that base's
+# constitutional evaluator. It never checks out or executes candidate code.
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  admission:
+    if: ${{ github.event_name == 'pull_request' }}
+    name: admission / pinned workflow
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      EXPECTED_TARGET_REPOSITORY: Arkhelion-Systems-Corp/Arkhelion-OS
+      TARGET_REPOSITORY: ${{ github.event.repository.full_name }}
+      EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      WORKFLOW_SOURCE_SHA: ${{ github.workflow_sha }}
+      WORKFLOW_REF: ${{ github.workflow_ref }}
+    steps:
+      - name: Bind immutable launcher and target identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$TARGET_REPOSITORY" = "$EXPECTED_TARGET_REPOSITORY" ] || {
+            echo "::error::unexpected target repository: $TARGET_REPOSITORY"
+            exit 1
+          }
+          [[ "$WORKFLOW_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::required-workflow source is not an immutable SHA"
+            exit 1
+          }
+          [[ "$EVENT_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::event base SHA invalid"
+            exit 1
+          }
+          [[ "$EVENT_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::event head SHA invalid"
+            exit 1
+          }
+          printf 'workflow_ref=%s\nworkflow_source_sha=%s\ntarget_repository=%s\ntarget_base_sha=%s\ntarget_head_sha=%s\n' \
+            "$WORKFLOW_REF" "$WORKFLOW_SOURCE_SHA" "$TARGET_REPOSITORY" "$EVENT_BASE_SHA" "$EVENT_HEAD_SHA"
+
+      - name: Checkout exact trusted target base only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.TARGET_REPOSITORY }}
+          ref: ${{ env.EVENT_BASE_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Refuse target-base checkout drift
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          [ "$actual" = "$EVENT_BASE_SHA" ] || {
+            echo "::error::trusted target-base drift: expected $EVENT_BASE_SHA got $actual"
+            exit 1
+          }
+          echo "trusted_target_base_sha=$actual"
+
+      - name: Setup Node 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: Prove target-base evaluator failure direction
+        run: node --test scripts/test-constitutional-guard.mjs
+
+      - name: Read target PR metadata without executing candidate code
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/arkhelion-ruleset-v2
+          node <<'NODE'
+          const fs = require('fs');
+          const token = process.env.GH_TOKEN;
+          const repo = process.env.TARGET_REPOSITORY;
+          const pr = Number(process.env.PR_NUMBER);
+          const eventBase = String(process.env.EVENT_BASE_SHA || '').toLowerCase();
+          const eventHead = String(process.env.EVENT_HEAD_SHA || '').toLowerCase();
+
+          async function request(route) {
+            const response = await fetch(`https://api.github.com/repos/${repo}${route}`, {
+              headers: {
+                Authorization: `Bearer ${token}`,
+                Accept: 'application/vnd.github+json',
+                'X-GitHub-Api-Version': '2022-11-28'
+              }
+            });
+            if (!response.ok) throw new Error(`github_${route}_http_${response.status}`);
+            return response.json();
+          }
+
+          async function all(route) {
+            const rows = [];
+            for (let page = 1; page <= 30; page += 1) {
+              const join = route.includes('?') ? '&' : '?';
+              const batch = await request(`${route}${join}per_page=100&page=${page}`);
+              if (!Array.isArray(batch)) throw new Error(`github_${route}_not_array`);
+              rows.push(...batch);
+              if (batch.length < 100) return rows;
+            }
+            throw new Error(`github_${route}_pagination_bound_exceeded`);
+          }
+
+          function assertIdentity(snapshot, phase) {
+            const liveBase = String(snapshot?.base?.sha || '').toLowerCase();
+            const liveHead = String(snapshot?.head?.sha || '').toLowerCase();
+            if (liveBase !== eventBase || liveHead !== eventHead) {
+              throw new Error(`target_pr_identity_drift_${phase}: expected base=${eventBase} head=${eventHead}; got base=${liveBase} head=${liveHead}`);
+            }
+          }
+
+          (async () => {
+            const before = await request(`/pulls/${pr}`);
+            assertIdentity(before, 'before');
+
+            const [files, reviews, comments] = await Promise.all([
+              all(`/pulls/${pr}/files`),
+              all(`/pulls/${pr}/reviews`),
+              all(`/issues/${pr}/comments`)
+            ]);
+
+            const after = await request(`/pulls/${pr}`);
+            assertIdentity(after, 'after');
+
+            const input = {
+              repository: repo,
+              pull_number: pr,
+              base_sha: eventBase,
+              head_sha: eventHead,
+              files: files.map((row) => ({
+                filename: row.filename,
+                status: row.status,
+                previous_filename: row.previous_filename || null
+              })),
+              reviews: reviews.map((row) => ({
+                id: row.id,
+                node_id: row.node_id,
+                user: { login: row.user?.login },
+                state: row.state,
+                commit_id: row.commit_id,
+                submitted_at: row.submitted_at
+              })),
+              comments: comments.map((row) => ({
+                id: row.id,
+                node_id: row.node_id,
+                user: { login: row.user?.login },
+                body: row.body,
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+                performed_via_github_app: row.performed_via_github_app
+                  ? { id: row.performed_via_github_app.id, slug: row.performed_via_github_app.slug || null }
+                  : null
+              }))
+            };
+            fs.writeFileSync('/tmp/arkhelion-ruleset-v2/input.json', JSON.stringify(input, null, 2) + '\n');
+          })().catch((error) => {
+            console.error(error?.stack || error);
+            process.exit(1);
+          });
+          NODE
+
+      - name: Evaluate exact target-base constitutional policy
+        run: node scripts/constitutional-guard.mjs /tmp/arkhelion-ruleset-v2/input.json /tmp/arkhelion-ruleset-v2/receipt.json
+
+      - name: Preserve immutable-source admission receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: ruleset-v2-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: /tmp/arkhelion-ruleset-v2/receipt.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce trusted verdict
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('fs');
+          const receipt = JSON.parse(fs.readFileSync('/tmp/arkhelion-ruleset-v2/receipt.json', 'utf8'));
+          console.log(JSON.stringify({
+            schema: receipt.schema,
+            result: receipt.result,
+            reason: receipt.reason,
+            base_sha: receipt.base_sha,
+            head_sha: receipt.head_sha,
+            constitutional_paths: receipt.constitutional_paths
+          }));
+          if (receipt.result !== 'PASS') process.exit(1);
+          NODE
+
+  freshness:
+    if: ${{ github.event_name == 'pull_request' }}
+    name: freshness / anchor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    env:
+      TARGET_REPOSITORY: ${{ github.event.repository.full_name }}
+      EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      WORKFLOW_SOURCE_SHA: ${{ github.workflow_sha }}
+    steps:
+      - name: Bind freshness identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::event base SHA invalid"; exit 1; }
+          [[ "$EVENT_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::event head SHA invalid"; exit 1; }
+          [[ "$WORKFLOW_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::workflow source SHA invalid"; exit 1; }
+          printf 'target_repository=%s\nworkflow_source_sha=%s\ntarget_base_sha=%s\ntarget_head_sha=%s\n' \
+            "$TARGET_REPOSITORY" "$WORKFLOW_SOURCE_SHA" "$EVENT_BASE_SHA" "$EVENT_HEAD_SHA"
+
+  merge_group_identity:
+    if: ${{ github.event_name == 'merge_group' }}
+    name: merge-group / pinned workflow
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    env:
+      WORKFLOW_SOURCE_SHA: ${{ github.workflow_sha }}
+      MERGE_GROUP_HEAD: ${{ github.sha }}
+    steps:
+      - name: Bind merge-group identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$WORKFLOW_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::workflow source SHA invalid"; exit 1; }
+          [[ "$MERGE_GROUP_HEAD" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::merge-group head invalid"; exit 1; }
+          printf 'workflow_source_sha=%s\nmerge_group_head=%s\n' "$WORKFLOW_SOURCE_SHA" "$MERGE_GROUP_HEAD"
